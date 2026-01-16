@@ -2,7 +2,7 @@ name: Daily URL Activator (Mongo)
 
 on:
     schedule:
-      - cron: '0 7 * * *'
+      - cron: '0 13 * * *'
 
     workflow_dispatch:
 
