@@ -1,0 +1,28 @@
+name: Daily URL Activator (Mongo)
+
+on:
+    schedule:
+      # 每天 UTC 13:00 (美东冬令时早上 8:00)
+      - cron: '0 13 * * *'
+
+jobs:
+  run-activator:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          # 记得在 GitHub Settings 里改名为 MONGODB_URI
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: python main.py
