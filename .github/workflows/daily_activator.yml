@@ -3,7 +3,7 @@ name: Daily URL Activator (Mongo)
 on:
     schedule:
       # 每天 UTC 13:00 (美东冬令时早上 8:00)
-      - cron: '0 13 * * *'
+      - cron: '0 7 * * *'
 
 jobs:
   run-activator:
