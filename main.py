@@ -12,7 +12,9 @@ POSTHOG_PROJECT_TOKEN = os.environ.get("POSTHOG_PROJECT_TOKEN")
 # Event names to track - add your events here
 POSTHOG_EVENT_NAMES = [
     "[Report] Analysis Completed",
-    "Application Opened"
+    "Application Opened",
+    "[Capture] Video Recording Completed",
+    "[Feedback] Praised Card",
     # Add more events here, e.g.:
     # "[Dashboard] Viewed",
     # "[Export] Completed",
@@ -241,8 +243,7 @@ def main():
         user_rows = query_posthog_event_counts(event_name)
 
         if not user_rows:
-            print(f"   No valid data found for '{event_name}'. Skipping.")
-            continue
+            raise RuntimeError(f"Event '{event_name}' not found or has no data. Please check the event name in PostHog.")
 
         print(f"   Users fetched: {len(user_rows)}")
 
@@ -252,15 +253,19 @@ def main():
         heavy_user_count = sum(1 for row in computed_rows if row["percentile"] >= 75.0)
         print(f"   Heavy users (>=75th): {heavy_user_count}/{len(computed_rows)}")
 
-        # Preview top users
-        print(f"\n   Preview of top users:")
-        for row in computed_rows[:5]:
+        # Preview top 25% users
+        top_25_percent_count = max(1, len(computed_rows) // 4)
+        print(f"\n   Preview of top 25% users (showing {top_25_percent_count}):")
+        for row in computed_rows[:top_25_percent_count]:
             print(
                 f'   - user={row["distinct_id"]}, '
                 f'percentile={row["percentile"]}'
             )
 
         # Step 3: Write person property back to PostHog
+        print(f"\n   Preparing to write property: {property_name} ({len(computed_rows)} users)")
+        if DRY_RUN:
+            print("   [DRY RUN] Skipping actual writes")
         success_count, failure_count = write_back_properties(
             event_name, property_name, computed_rows
         )
