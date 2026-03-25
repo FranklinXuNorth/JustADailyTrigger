@@ -12,6 +12,7 @@ POSTHOG_PROJECT_TOKEN = os.environ.get("POSTHOG_PROJECT_TOKEN")
 # Event names to track - add your events here
 POSTHOG_EVENT_NAMES = [
     "[Report] Analysis Completed",
+    "Application Opened"
     # Add more events here, e.g.:
     # "[Dashboard] Viewed",
     # "[Export] Completed",
