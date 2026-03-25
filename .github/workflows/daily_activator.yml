@@ -1,15 +1,24 @@
-name: Daily URL Activator (Mongo)
+name: Daily PostHog Percentile Refresher
 
 on:
     schedule:
       - cron: '0 13 * * *'
 
     workflow_dispatch:
+      inputs:
+        dry_run:
+          description: 'Dry run (no writes to PostHog)'
+          required: false
+          default: 'true'
+          type: choice
+          options:
+            - 'true'
+            - 'false'
 
 jobs:
   run-activator:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -22,8 +31,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run percentile refresher
         env:
-          # 记得在 GitHub Settings 里改名为 MONGODB_URI
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          POSTHOG_PROJECT_ID: ${{ secrets.POSTHOG_PROJECT_ID }}
+          POSTHOG_PROJECT_API_KEY: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
+          POSTHOG_PROJECT_TOKEN: ${{ secrets.POSTHOG_PROJECT_TOKEN }}
+          POSTHOG_BASE_URL: ${{ secrets.POSTHOG_BASE_URL || 'https://us.i.posthog.com' }}
+          POSTHOG_LOOKBACK_DAYS: ${{ secrets.POSTHOG_LOOKBACK_DAYS || '3650' }}
+          WRITEBACK_SLEEP_SECONDS: ${{ secrets.WRITEBACK_SLEEP_SECONDS || '0.05' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python main.py

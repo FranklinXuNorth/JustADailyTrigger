@@ -1,96 +1,245 @@
 import os
+import time
 import requests
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
 
-# 配置：这里填你的数据库名和集合名
-DB_NAME = "slime_vivarium"
-COLLECTION_NAME = "urls"
+# Configuration
+POSTHOG_BASE_URL = os.environ.get("POSTHOG_BASE_URL", "https://us.i.posthog.com").rstrip("/")
+POSTHOG_PROJECT_ID = os.environ.get("POSTHOG_PROJECT_ID")
+POSTHOG_PROJECT_API_KEY = os.environ.get("POSTHOG_PROJECT_API_KEY")
+POSTHOG_PROJECT_TOKEN = os.environ.get("POSTHOG_PROJECT_TOKEN")
 
-def get_urls_from_db():
+# Fixed event name
+POSTHOG_EVENT_NAME = "[Report] Analysis Completed"
+
+# Optional settings
+POSTHOG_LOOKBACK_DAYS = int(os.environ.get("POSTHOG_LOOKBACK_DAYS", "3650"))
+WRITEBACK_SLEEP_SECONDS = float(os.environ.get("WRITEBACK_SLEEP_SECONDS", "0.05"))
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+
+def validate_env():
+    """Validate required environment variables."""
+    missing = []
+    if not POSTHOG_PROJECT_ID:
+        missing.append("POSTHOG_PROJECT_ID")
+    if not POSTHOG_PROJECT_API_KEY:
+        missing.append("POSTHOG_PROJECT_API_KEY")
+    if not POSTHOG_PROJECT_TOKEN:
+        missing.append("POSTHOG_PROJECT_TOKEN")
+
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+def query_posthog_completion_counts():
     """
-    从 MongoDB 获取 URL 列表
-    结构假设: 数据库中有一个文档，内容类似 {"site1": "http...", "site2": "http..."}
+    Query PostHog for per-user total completion counts.
+
+    This uses the Query API with HogQL and groups by distinct_id.
     """
-    mongo_uri = os.environ.get("MONGODB_URI")
-    if not mongo_uri:
-        raise ValueError("❌ 错误: 环境变量 MONGODB_URI 未设置")
+    url = f"{POSTHOG_BASE_URL}/api/projects/{POSTHOG_PROJECT_ID}/query/"
 
-    client = None
-    try:
-        # 1. 连接 MongoDB
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        client.admin.command('ping') # 测试连接
-        
-        db = client[DB_NAME]
-        collection = db[COLLECTION_NAME]
-        
-        # 2. 获取唯一的那个文档 (find_one)
-        # 如果你有很多文档，这里只会取第一条。建议保持集合里只有这一条配置数据。
-        config_doc = collection.find_one()
-        
-        if not config_doc:
-            print("⚠️ 数据库为空，未找到配置文档")
-            return []
+    headers = {
+        "Authorization": f"Bearer {POSTHOG_PROJECT_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-        url_list = []
-        
-        # 3. 遍历字典 (Dict)
-        for key, value in config_doc.items():
-            # 排除 MongoDB 自动生成的 _id 字段
-            if key == "_id":
-                continue
-            
-            # 简单的校验：必须是字符串且以 http 开头
-            if isinstance(value, str) and value.startswith("http"):
-                print(f"🔎 发现目标 [{key}]: {value}")
-                url_list.append(value)
+    hogql = f"""
+    SELECT
+        distinct_id,
+        count() AS completion_total
+    FROM events
+    WHERE event = '{POSTHOG_EVENT_NAME}'
+      AND timestamp >= now() - INTERVAL {POSTHOG_LOOKBACK_DAYS} DAY
+      AND distinct_id IS NOT NULL
+    GROUP BY distinct_id
+    ORDER BY completion_total DESC, distinct_id ASC
+    """
+
+    payload = {
+        "query": {
+            "kind": "HogQLQuery",
+            "query": hogql
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=120)
+    response.raise_for_status()
+    data = response.json()
+
+    # Query API commonly returns tabular data as columns + results
+    columns = data.get("columns")
+    results = data.get("results")
+
+    if columns is None or results is None:
+        # Some responses may nest the result
+        nested = data.get("result", {})
+        columns = nested.get("columns")
+        results = nested.get("results")
+
+    if not columns or results is None:
+        raise RuntimeError(f"Unexpected Query API response shape: {data}")
+
+    rows = []
+    for row in results:
+        if isinstance(row, list):
+            row_dict = {columns[i]: row[i] for i in range(len(columns))}
+        elif isinstance(row, dict):
+            row_dict = row
+        else:
+            continue
+
+        distinct_id = row_dict.get("distinct_id")
+        completion_total = row_dict.get("completion_total")
+
+        if distinct_id is None or completion_total is None:
+            continue
+
+        rows.append({
+            "distinct_id": str(distinct_id),
+            "completion_total": int(completion_total),
+        })
+
+    return rows
+
+
+def compute_percentiles(user_rows):
+    """
+    Compute percentile rank.
+
+    Logic:
+    - Sort ascending by completion_total
+    - Map rank position to 0..100 percentile
+    """
+    if not user_rows:
+        return []
+
+    # Sort ascending for percentile assignment
+    sorted_rows = sorted(
+        user_rows,
+        key=lambda x: (x["completion_total"], x["distinct_id"])
+    )
+
+    n = len(sorted_rows)
+
+    if n == 1:
+        single = sorted_rows[0].copy()
+        single["percentile"] = 100.0
+        return [single]
+
+    computed = []
+    for idx, row in enumerate(sorted_rows):
+        percentile = (idx / (n - 1)) * 100.0
+        computed.append({
+            "distinct_id": row["distinct_id"],
+            "percentile": round(percentile, 2),
+        })
+
+    # Sort back descending for preview/logging
+    computed.sort(key=lambda x: (-x["percentile"], x["distinct_id"]))
+    return computed
+
+
+def write_person_property(distinct_id, percentile):
+    """
+    Write person property back to PostHog using a $set event.
+    Only writes: ai_completed_percentile
+    """
+    url = f"{POSTHOG_BASE_URL}/i/v0/e/"
+
+    payload = {
+        "api_key": POSTHOG_PROJECT_TOKEN,
+        "event": "$set",
+        "distinct_id": distinct_id,
+        "properties": {
+            "$set": {
+                "ai_completed_percentile": percentile
+            }
+        }
+    }
+
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+
+
+def write_back_properties(computed_rows):
+    """Write all computed rows back to PostHog."""
+    total = len(computed_rows)
+    success = 0
+    failures = 0
+
+    for idx, row in enumerate(computed_rows, start=1):
+        try:
+            if DRY_RUN:
+                print(
+                    f"[DRY RUN] distinct_id={row['distinct_id']}, "
+                    f"percentile={row['percentile']}"
+                )
             else:
-                # 忽略非 URL 的字段 (比如你可能以后会加 updated_at 之类的字段)
-                pass
-        
-        return url_list
+                write_person_property(
+                    distinct_id=row["distinct_id"],
+                    percentile=row["percentile"],
+                )
 
-    except ConnectionFailure:
-        print("❌ 无法连接到 MongoDB 服务器")
-        return []
-    except Exception as e:
-        print(f"❌ 数据库读取发生未知错误: {e}")
-        return []
-    finally:
-        if client:
-            client.close()
+            success += 1
+
+        except Exception as e:
+            failures += 1
+            print(
+                f" Failed to update distinct_id={row['distinct_id']}: {e}"
+            )
+
+        if WRITEBACK_SLEEP_SECONDS > 0:
+            time.sleep(WRITEBACK_SLEEP_SECONDS)
+
+        if idx % 100 == 0 or idx == total:
+            print(f" Progress: {idx}/{total} processed")
+
+    return success, failures
+
 
 def main():
     """
-    主程序：遍历列表并激活 API
+    Main job entry:
+    1. Fetch user completion counts from PostHog
+    2. Compute percentile ranks
+    3. Write ai_completed_percentile property back to PostHog
     """
-    print("🚀 开始执行每日激活任务 (Dict 版)...")
-    
-    target_urls = get_urls_from_db()
-    
-    if not target_urls:
-        print("⚠️ 列表为空或未找到有效 URL，任务结束。")
+    print(" Start refreshing PostHog ai_completed_percentile...")
+
+    validate_env()
+
+    # Step 1: Fetch raw aggregated data from PostHog
+    user_rows = query_posthog_completion_counts()
+
+    if not user_rows:
+        print(" No valid completion data found. Job finished.")
         return
 
-    print(f"📋 待激活 URL 总数: {len(target_urls)}\n")
+    print(f" Users fetched from PostHog: {len(user_rows)}")
 
-    success_count = 0
-    for url in target_urls:
-        try:
-            # 发送请求
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code < 400:
-                print(f"✅ [成功] {url} - Status: {response.status_code}")
-                success_count += 1
-            else:
-                print(f"⚠️ [异常] {url} - Status: {response.status_code}")
-                
-        except Exception as e:
-            print(f"❌ [失败] {url} - Error: {e}")
+    # Step 2: Compute percentile rank
+    computed_rows = compute_percentiles(user_rows)
 
-    print(f"\n🎉 任务完成! 成功激活: {success_count}/{len(target_urls)}")
+    heavy_user_count = sum(1 for row in computed_rows if row["percentile"] >= 75.0)
+    print(f" Heavy users (>=75th percentile): {heavy_user_count}/{len(computed_rows)}")
+
+    # Preview top users
+    print("\n Preview of top users:")
+    for row in computed_rows[:10]:
+        print(
+            f'- user={row["distinct_id"]}, '
+            f'percentile={row["percentile"]}'
+        )
+
+    # Step 3: Write person property back to PostHog
+    success_count, failure_count = write_back_properties(computed_rows)
+
+    print("\n Job finished.")
+    print(f" Successful updates: {success_count}")
+    print(f" Failed updates: {failure_count}")
+    print(f" Heavy users (>=75th): {heavy_user_count}")
+
 
 if __name__ == "__main__":
     main()
