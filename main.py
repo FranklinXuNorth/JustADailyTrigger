@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 
@@ -8,8 +9,13 @@ POSTHOG_PROJECT_ID = os.environ.get("POSTHOG_PROJECT_ID")
 POSTHOG_PROJECT_API_KEY = os.environ.get("POSTHOG_PROJECT_API_KEY")
 POSTHOG_PROJECT_TOKEN = os.environ.get("POSTHOG_PROJECT_TOKEN")
 
-# Fixed event name
-POSTHOG_EVENT_NAME = "[Report] Analysis Completed"
+# Event names to track - add your events here
+POSTHOG_EVENT_NAMES = [
+    "[Report] Analysis Completed",
+    # Add more events here, e.g.:
+    # "[Dashboard] Viewed",
+    # "[Export] Completed",
+]
 
 # Optional settings
 POSTHOG_LOOKBACK_DAYS = int(os.environ.get("POSTHOG_LOOKBACK_DAYS", "3650"))
@@ -31,11 +37,23 @@ def validate_env():
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
 
-def query_posthog_completion_counts():
+def event_name_to_property_name(event_name: str) -> str:
     """
-    Query PostHog for per-user total completion counts.
+    Convert event name to property name slug.
+    Example: "[Report] Analysis Completed" -> "report-analysis-completed-percentile"
+    """
+    # Remove brackets, lowercase, replace spaces/special chars with hyphens
+    slug = event_name.lower()
+    slug = re.sub(r'[\[\]]', '', slug)  # Remove brackets
+    slug = re.sub(r'[^\w\s-]', '', slug)  # Remove special chars except spaces and hyphens
+    slug = re.sub(r'[\s_]+', '-', slug)  # Replace spaces/underscores with hyphens
+    slug = slug.strip('-')
+    return f"{slug}-percentile"
 
-    This uses the Query API with HogQL and groups by distinct_id.
+
+def query_posthog_event_counts(event_name: str):
+    """
+    Query PostHog for per-user total counts for a specific event.
     """
     url = f"{POSTHOG_BASE_URL}/api/projects/{POSTHOG_PROJECT_ID}/query/"
 
@@ -44,16 +62,19 @@ def query_posthog_completion_counts():
         "Content-Type": "application/json",
     }
 
+    # Escape single quotes in event name for HogQL
+    escaped_event = event_name.replace("'", "''")
+
     hogql = f"""
     SELECT
         distinct_id,
-        count() AS completion_total
+        count() AS event_total
     FROM events
-    WHERE event = '{POSTHOG_EVENT_NAME}'
+    WHERE event = '{escaped_event}'
       AND timestamp >= now() - INTERVAL {POSTHOG_LOOKBACK_DAYS} DAY
       AND distinct_id IS NOT NULL
     GROUP BY distinct_id
-    ORDER BY completion_total DESC, distinct_id ASC
+    ORDER BY event_total DESC, distinct_id ASC
     """
 
     payload = {
@@ -67,12 +88,10 @@ def query_posthog_completion_counts():
     response.raise_for_status()
     data = response.json()
 
-    # Query API commonly returns tabular data as columns + results
     columns = data.get("columns")
     results = data.get("results")
 
     if columns is None or results is None:
-        # Some responses may nest the result
         nested = data.get("result", {})
         columns = nested.get("columns")
         results = nested.get("results")
@@ -90,14 +109,14 @@ def query_posthog_completion_counts():
             continue
 
         distinct_id = row_dict.get("distinct_id")
-        completion_total = row_dict.get("completion_total")
+        event_total = row_dict.get("event_total")
 
-        if distinct_id is None or completion_total is None:
+        if distinct_id is None or event_total is None:
             continue
 
         rows.append({
             "distinct_id": str(distinct_id),
-            "completion_total": int(completion_total),
+            "event_total": int(event_total),
         })
 
     return rows
@@ -106,18 +125,13 @@ def query_posthog_completion_counts():
 def compute_percentiles(user_rows):
     """
     Compute percentile rank.
-
-    Logic:
-    - Sort ascending by completion_total
-    - Map rank position to 0..100 percentile
     """
     if not user_rows:
         return []
 
-    # Sort ascending for percentile assignment
     sorted_rows = sorted(
         user_rows,
-        key=lambda x: (x["completion_total"], x["distinct_id"])
+        key=lambda x: (x["event_total"], x["distinct_id"])
     )
 
     n = len(sorted_rows)
@@ -135,15 +149,13 @@ def compute_percentiles(user_rows):
             "percentile": round(percentile, 2),
         })
 
-    # Sort back descending for preview/logging
     computed.sort(key=lambda x: (-x["percentile"], x["distinct_id"]))
     return computed
 
 
-def write_person_property(distinct_id, percentile):
+def write_person_property(distinct_id, property_name, percentile):
     """
-    Write person property back to PostHog using a $set event.
-    Only writes: ai_completed_percentile
+    Write a single person property back to PostHog using a $set event.
     """
     url = f"{POSTHOG_BASE_URL}/i/v0/e/"
 
@@ -153,7 +165,7 @@ def write_person_property(distinct_id, percentile):
         "distinct_id": distinct_id,
         "properties": {
             "$set": {
-                "ai_completed_percentile": percentile
+                property_name: percentile
             }
         }
     }
@@ -162,7 +174,7 @@ def write_person_property(distinct_id, percentile):
     response.raise_for_status()
 
 
-def write_back_properties(computed_rows):
+def write_back_properties(event_name, property_name, computed_rows):
     """Write all computed rows back to PostHog."""
     total = len(computed_rows)
     success = 0
@@ -172,12 +184,13 @@ def write_back_properties(computed_rows):
         try:
             if DRY_RUN:
                 print(
-                    f"[DRY RUN] distinct_id={row['distinct_id']}, "
+                    f"[DRY RUN] {event_name} | distinct_id={row['distinct_id']}, "
                     f"percentile={row['percentile']}"
                 )
             else:
                 write_person_property(
                     distinct_id=row["distinct_id"],
+                    property_name=property_name,
                     percentile=row["percentile"],
                 )
 
@@ -186,14 +199,14 @@ def write_back_properties(computed_rows):
         except Exception as e:
             failures += 1
             print(
-                f" Failed to update distinct_id={row['distinct_id']}: {e}"
+                f" Failed to update {event_name} | distinct_id={row['distinct_id']}: {e}"
             )
 
         if WRITEBACK_SLEEP_SECONDS > 0:
             time.sleep(WRITEBACK_SLEEP_SECONDS)
 
         if idx % 100 == 0 or idx == total:
-            print(f" Progress: {idx}/{total} processed")
+            print(f"   Progress: {idx}/{total} processed")
 
     return success, failures
 
@@ -201,44 +214,67 @@ def write_back_properties(computed_rows):
 def main():
     """
     Main job entry:
-    1. Fetch user completion counts from PostHog
+    1. For each event name, fetch user counts from PostHog
     2. Compute percentile ranks
-    3. Write ai_completed_percentile property back to PostHog
+    3. Write dynamic property names back to PostHog
     """
-    print(" Start refreshing PostHog ai_completed_percentile...")
+    print(" Start refreshing PostHog percentile properties...")
 
     validate_env()
 
-    # Step 1: Fetch raw aggregated data from PostHog
-    user_rows = query_posthog_completion_counts()
-
-    if not user_rows:
-        print(" No valid completion data found. Job finished.")
+    if not POSTHOG_EVENT_NAMES:
+        print(" No event names configured. Add events to POSTHOG_EVENT_NAMES.")
         return
 
-    print(f" Users fetched from PostHog: {len(user_rows)}")
+    total_success = 0
+    total_failure = 0
 
-    # Step 2: Compute percentile rank
-    computed_rows = compute_percentiles(user_rows)
+    for event_name in POSTHOG_EVENT_NAMES:
+        property_name = event_name_to_property_name(event_name)
+        print(f"\n{'='*60}")
+        print(f" Processing event: {event_name}")
+        print(f" Property name: {property_name}")
+        print(f"{'='*60}")
 
-    heavy_user_count = sum(1 for row in computed_rows if row["percentile"] >= 75.0)
-    print(f" Heavy users (>=75th percentile): {heavy_user_count}/{len(computed_rows)}")
+        # Step 1: Fetch raw aggregated data from PostHog
+        user_rows = query_posthog_event_counts(event_name)
 
-    # Preview top users
-    print("\n Preview of top users:")
-    for row in computed_rows[:10]:
-        print(
-            f'- user={row["distinct_id"]}, '
-            f'percentile={row["percentile"]}'
+        if not user_rows:
+            print(f"   No valid data found for '{event_name}'. Skipping.")
+            continue
+
+        print(f"   Users fetched: {len(user_rows)}")
+
+        # Step 2: Compute percentile rank
+        computed_rows = compute_percentiles(user_rows)
+
+        heavy_user_count = sum(1 for row in computed_rows if row["percentile"] >= 75.0)
+        print(f"   Heavy users (>=75th): {heavy_user_count}/{len(computed_rows)}")
+
+        # Preview top users
+        print(f"\n   Preview of top users:")
+        for row in computed_rows[:5]:
+            print(
+                f'   - user={row["distinct_id"]}, '
+                f'percentile={row["percentile"]}'
+            )
+
+        # Step 3: Write person property back to PostHog
+        success_count, failure_count = write_back_properties(
+            event_name, property_name, computed_rows
         )
 
-    # Step 3: Write person property back to PostHog
-    success_count, failure_count = write_back_properties(computed_rows)
+        total_success += success_count
+        total_failure += failure_count
 
-    print("\n Job finished.")
-    print(f" Successful updates: {success_count}")
-    print(f" Failed updates: {failure_count}")
-    print(f" Heavy users (>=75th): {heavy_user_count}")
+        print(f"\n   Finished {event_name}")
+        print(f"   Successful: {success_count}, Failed: {failure_count}")
+
+    print(f"\n{'='*60}")
+    print(" All jobs finished.")
+    print(f" Total successful updates: {total_success}")
+    print(f" Total failed updates: {total_failure}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
