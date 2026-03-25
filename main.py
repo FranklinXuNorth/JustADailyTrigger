@@ -76,6 +76,9 @@ def query_posthog_event_counts(event_name: str):
     WHERE event = '{escaped_event}'
       AND timestamp >= now() - INTERVAL {POSTHOG_LOOKBACK_DAYS} DAY
       AND distinct_id IS NOT NULL
+      AND person.properties.auth_id IS NOT NULL
+      AND person.properties.auth_id != ''
+      AND coalesce(person.properties.is_test_account, false) = false
     GROUP BY distinct_id
     ORDER BY event_total DESC, distinct_id ASC
     """
