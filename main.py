@@ -79,6 +79,8 @@ def query_posthog_event_counts(event_name: str):
       AND person.properties.auth_id IS NOT NULL
       AND person.properties.auth_id != ''
       AND coalesce(person.properties.is_test_account, false) = false
+      AND person.id NOT IN (SELECT person_id FROM cohort_people WHERE cohort_id = 230221)
+      AND person.id NOT IN (SELECT person_id FROM cohort_people WHERE cohort_id = 231406)
     GROUP BY distinct_id
     ORDER BY event_total DESC, distinct_id ASC
     """
