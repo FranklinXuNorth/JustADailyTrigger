@@ -161,6 +161,85 @@ def compute_percentiles(user_rows):
     return computed
 
 
+def query_excluded_cohort_users():
+    """
+    Query PostHog for distinct_ids of users in the excluded test cohorts.
+    """
+    url = f"{POSTHOG_BASE_URL}/api/projects/{POSTHOG_PROJECT_ID}/query/"
+
+    headers = {
+        "Authorization": f"Bearer {POSTHOG_PROJECT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    hogql = """
+    SELECT DISTINCT distinct_id
+    FROM events
+    WHERE person.id IN (
+        SELECT person_id FROM cohort_people WHERE cohort_id IN (230221, 231406)
+    )
+    AND distinct_id IS NOT NULL
+    AND person.properties.auth_id IS NOT NULL
+    AND person.properties.auth_id != ''
+    """
+
+    payload = {
+        "query": {
+            "kind": "HogQLQuery",
+            "query": hogql
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=120)
+    response.raise_for_status()
+    data = response.json()
+
+    columns = data.get("columns")
+    results = data.get("results")
+
+    if columns is None or results is None:
+        nested = data.get("result", {})
+        columns = nested.get("columns")
+        results = nested.get("results")
+
+    if not columns or results is None:
+        return []
+
+    distinct_ids = set()
+    for row in results:
+        if isinstance(row, list):
+            distinct_id = row[0]
+        elif isinstance(row, dict):
+            distinct_id = row.get("distinct_id")
+        else:
+            continue
+        if distinct_id is not None:
+            distinct_ids.add(str(distinct_id))
+
+    return list(distinct_ids)
+
+
+def clear_person_property(distinct_id, property_name):
+    """
+    Clear a person property by setting it to null.
+    """
+    url = f"{POSTHOG_BASE_URL}/i/v0/e/"
+
+    payload = {
+        "api_key": POSTHOG_PROJECT_TOKEN,
+        "event": "$set",
+        "distinct_id": distinct_id,
+        "properties": {
+            "$set": {
+                property_name: None
+            }
+        }
+    }
+
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+
+
 def write_person_property(distinct_id, property_name, percentile):
     """
     Write a single person property back to PostHog using a $set event.
@@ -234,6 +313,11 @@ def main():
         print(" No event names configured. Add events to POSTHOG_EVENT_NAMES.")
         return
 
+    # Pre-fetch excluded cohort users once
+    print("\n Fetching excluded cohort users...")
+    excluded_users = query_excluded_cohort_users()
+    print(f" Excluded cohort users found: {len(excluded_users)}")
+
     total_success = 0
     total_failure = 0
 
@@ -277,6 +361,31 @@ def main():
 
         total_success += success_count
         total_failure += failure_count
+
+        # Step 4: Clear properties for excluded cohort users
+        if excluded_users:
+            print(f"\n   Clearing property for {len(excluded_users)} excluded cohort users...")
+            clear_success = 0
+            clear_failure = 0
+            for idx, duid in enumerate(excluded_users, start=1):
+                try:
+                    if DRY_RUN:
+                        print(
+                            f"   [DRY RUN] Clear {property_name} | distinct_id={duid}"
+                        )
+                    else:
+                        clear_person_property(duid, property_name)
+                    clear_success += 1
+                except Exception as e:
+                    clear_failure += 1
+                    print(
+                        f"   Failed to clear {event_name} | distinct_id={duid}: {e}"
+                    )
+                if WRITEBACK_SLEEP_SECONDS > 0:
+                    time.sleep(WRITEBACK_SLEEP_SECONDS)
+                if idx % 100 == 0 or idx == len(excluded_users):
+                    print(f"   Clear progress: {idx}/{len(excluded_users)} processed")
+            print(f"   Cleared: {clear_success}, Failed: {clear_failure}")
 
         print(f"\n   Finished {event_name}")
         print(f"   Successful: {success_count}, Failed: {failure_count}")
